@@ -1,0 +1,407 @@
+---
+title: "Movement Analysis I"
+author: "Lejla Beganovic"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    code-fold: false
+    embed-resources: true
+---
+
+# Introduction
+
+Understanding how people move is relevant in many areas, from transportation planning to public health. In this task, GPS movement data from the GeoLife project (Zheng et al., 2011) is used to predict the transportation mode of individual GPS points recorded in Beijing. The dataset includes labelled trajectories from 73 users, covering modes such as walking, cycling, driving, bus, subway, and train.
+
+The idea is to build a model that can infer the transport mode from movement parameters like speed, acceleration, and sinuosity, since this information is not directly measured by the GPS device. First, a minimal per-segment example is worked through, and then this is extended to per-point predictions.
+
+---
+
+# Minimal Example: Per-Segment Approach
+
+## Step 1: Load the Data
+
+```{r}
+#| message: false
+#| warning: false
+
+library(sf)
+library(dplyr)
+
+pfad <- "C:/Users/Lejlum/movement_analysis_I/Movement Analysis I-20260501"
+
+training_dataset <- read_sf(file.path(pfad, "tracks_1.gpkg"), layer = "training") |>
+  mutate(data = "training")
+testing_dataset <- read_sf(file.path(pfad, "tracks_1.gpkg"), layer = "testing") |>
+  mutate(data = "testing")
+validation_dataset <- read_sf(file.path(pfad, "tracks_1.gpkg"), layer = "validation") |>
+  mutate(data = "validation")
+
+full_dataset <- bind_rows(training_dataset, testing_dataset, validation_dataset)
+
+glimpse(full_dataset)
+```
+
+Let's first get an overview of where the data was collected.
+
+```{r}
+#| message: false
+#| warning: false
+#| results: hide
+
+library(ggplot2)
+library(ggspatial)
+
+ggplot() +
+  annotation_map_tile(type = "cartolight", zoom = 10, quiet = TRUE) +
+  geom_sf(data = full_dataset, size = 0.05, alpha = 0.5) +
+  theme_void() +
+  labs(caption = "Map tiles: CartoDB | Data: GeoLife (Zheng et al. 2011)")
+```
+
+The trajectories are spread across the greater Beijing area, with most of them concentrated in the city centre. This makes sense given that the data comes from everyday urban movement.
+
+## Step 2: Feature Engineering
+
+To be able to predict the transport mode, we first need to create features that describe how someone is moving. Here, three movement parameters are computed: speed, acceleration, and sinuosity. These are derived from the spatial and temporal relationships between consecutive GPS points within each trajectory.
+
+### Speed
+
+Speed is simply the distance between two consecutive points divided by the time between them.
+
+```{r}
+#| message: false
+#| warning: false
+
+full_dataset <- full_dataset |>
+  mutate(
+    steplength = as.numeric(st_distance(lead(geom), geom, by_element = TRUE)),
+    timelag    = as.numeric(difftime(lead(datetime), datetime, units = "secs")),
+    speed      = steplength / timelag,
+    .by = track_id
+  )
+```
+
+To get a sense of how speed differs between modes, the mean speed per segment is visualized as a boxplot.
+
+```{r}
+#| message: false
+#| warning: false
+#| fig-cap: "Figure 1: Average speed per segment for different transportation modes."
+
+library(forcats)
+
+full_dataset |>
+  st_drop_geometry() |>
+  filter(!is.na(mode)) |>
+  summarise(
+    speed = mean(speed, na.rm = TRUE),
+    .by = c(mode, track_id)
+  ) |>
+  mutate(mode = fct_reorder(mode, speed)) |>
+  ggplot() +
+  geom_boxplot(aes(speed, mode, fill = mode)) +
+  theme(legend.position = "none") +
+  labs(x = "Speed (m/s)", y = "Mode")
+```
+
+Figure 1 shows that speed differs quite clearly between the modes. Walking and cycling are the slowest, while train is by far the fastest. Bus and car have overlapping speed ranges, which already suggests that speed alone will not be enough to tell them apart. This is also why additional features like sinuosity and acceleration are needed.
+
+### Acceleration
+
+Acceleration describes how quickly the speed changes over time. Modes like walking and cycling tend to have more frequent speed changes, while driving or taking the train is usually smoother.
+
+```{r}
+#| message: false
+#| warning: false
+
+full_dataset <- full_dataset |>
+  mutate(
+    acceleration = (lead(speed) - speed) / timelag,
+    .by = track_id
+  )
+```
+
+### Sinuosity
+
+Sinuosity describes how curved a path is. A perfectly straight path has a sinuosity of 1, and more winding paths have higher values. Here, sinuosity is computed over a 5-point window, by comparing the total distance traveled to the straight-line distance between the start and end of the window.
+
+```{r}
+#| message: false
+#| warning: false
+
+library(zoo)
+
+full_dataset <- full_dataset |>
+  mutate(
+    straight_dist5 = as.numeric(st_distance(lead(geom, 5), geom, by_element = TRUE)),
+    full_dist5     = rollsum(steplength, 5, fill = NA, align = "left"),
+    sinuosity      = full_dist5 / straight_dist5,
+    .by = track_id
+  )
+```
+
+## Step 3: Training a Model
+
+For this first model, the point-level features are aggregated per segment using the mean, maximum, and minimum. A CART decision tree is trained because it is easy to interpret and gives a good starting point.
+
+```{r}
+#| message: false
+#| warning: false
+
+mean2 <- \(x) mean(x, na.rm = TRUE)
+max2  <- \(x) max(x,  na.rm = TRUE)
+min2  <- \(x) min(x,  na.rm = TRUE)
+
+tracks_smry <- full_dataset |>
+  st_drop_geometry() |>
+  select(data, track_id, mode, steplength, timelag, speed, sinuosity) |>
+  group_by(data, track_id, mode) |>
+  summarise(
+    across(
+      c(steplength, timelag, speed, sinuosity),
+      list(mean = mean2, max = max2, min = min2)
+    )
+  ) |>
+  mutate(mode = factor(mode)) |>
+  ungroup() |>
+  select(-track_id)
+
+tracks_training   <- tracks_smry |> filter(data == "training")   |> select(-data)
+tracks_testing    <- tracks_smry |> filter(data == "testing")    |> select(-data)
+tracks_validation <- tracks_smry |> filter(data == "validation") |> select(-data)
+```
+
+```{r}
+#| message: false
+#| warning: false
+#| fig-cap: "Figure 2: Decision tree trained on segment-level movement features."
+
+library(rpart)
+library(rpart.plot)
+
+cart_model <- rpart(mode ~ ., data = tracks_training, method = "class")
+
+rpart.plot(cart_model, type = 2)
+```
+
+The tree in Figure 2 shows that `speed_mean` is the most important variable for the first split. Segments with a mean speed below 2.5 m/s are mostly classified as walking (46% of all segments). Faster segments are split further using `steplength_mean`, `steplength_max`, and `timelag_mean` to separate bike, bus, car, subway, and train. Subway (4%) is separated using `speed_max >= 23`, while train (1%) ends up in the deepest branch through a combination of high step length and high time lag.
+
+## Step 4: Evaluating the Model
+
+```{r}
+#| message: false
+#| warning: false
+
+library(caret)
+
+predictions <- predict(cart_model, tracks_testing)
+
+tracks_testing$prediction <- colnames(predictions)[apply(predictions, 1, which.max)]
+tracks_testing$prediction <- factor(tracks_testing$prediction)
+
+tracks_testing$mode <- factor(
+  tracks_testing$mode,
+  levels = sort(unique(as.character(tracks_testing$mode)))
+)
+
+confusionMatrix(tracks_testing$prediction, reference = tracks_testing$mode)
+```
+
+The model reaches an overall accuracy of about 69%. Walking is classified quite well, with a sensitivity of 0.92, which makes sense given how different its speed is from all other modes. Train has a sensitivity of 0.67, which is moderate, but its specificity is very high (0.998), meaning almost nothing is wrongly predicted as train. The biggest problems are with bus and car: bus only reaches 62% sensitivity and car only 51%. This is likely because both modes have similar speeds in city traffic and it is hard to separate them based on movement alone.
+
+## Step 5: Predicting the Validation Data
+
+```{r}
+#| message: false
+#| warning: false
+
+predictions_validation <- predict(cart_model, tracks_validation)
+
+tracks_validation$prediction <- colnames(predictions_validation)[
+  apply(predictions_validation, 1, which.max)
+]
+tracks_validation$prediction <- factor(tracks_validation$prediction)
+
+cat("Predicted class distribution in validation set:\n")
+print(table(tracks_validation$prediction))
+```
+
+The predicted distribution in the validation set looks similar to what was seen in the training data, which suggests the model is not overfitting too much.
+
+---
+
+# Extension: Per-Point Predictions
+
+In the minimal example, features were aggregated per segment before training. The actual goal of this task is to predict the transport mode for every individual GPS point. This is harder because single points are noisier, but it gives more detailed predictions.
+
+## Feature Engineering at the Point Level
+
+In addition to speed, acceleration, and sinuosity, a turning angle feature is added here. The turning angle measures the direction change between consecutive steps, which helps distinguish walking and cycling (more turning) from motorised modes (generally smoother).
+
+```{r}
+#| message: false
+#| warning: false
+
+full_dataset <- full_dataset |>
+  mutate(
+    dx = as.numeric(lead(st_coordinates(geom)[, 1]) - st_coordinates(geom)[, 1]),
+    dy = as.numeric(lead(st_coordinates(geom)[, 2]) - st_coordinates(geom)[, 2]),
+    .by = track_id
+  )
+
+full_dataset <- full_dataset |>
+  mutate(
+    azi_next   = atan2(dy, dx),
+    azi_prev   = lag(azi_next),
+    turn_angle = atan2(sin(azi_next - azi_prev), cos(azi_next - azi_prev)),
+    .by = track_id
+  )
+```
+
+## Preparing Point-Level Training and Testing Data
+
+No aggregation is applied here. Each row is one GPS point with its own feature values. Points at segment boundaries where features cannot be computed are removed.
+
+```{r}
+#| message: false
+#| warning: false
+
+feat_cols <- c("speed", "acceleration", "sinuosity", "turn_angle")
+
+point_data <- full_dataset |>
+  st_drop_geometry() |>
+  select(data, mode, all_of(feat_cols)) |>
+  filter(if_all(all_of(feat_cols), ~ is.finite(.)))
+
+point_train <- point_data |>
+  filter(data == "training", !is.na(mode)) |>
+  select(-data) |>
+  mutate(mode = factor(mode))
+
+point_test <- point_data |>
+  filter(data == "testing", !is.na(mode)) |>
+  select(-data) |>
+  mutate(mode = factor(mode))
+
+cat("Training points:", nrow(point_train), "\n")
+cat("Testing points:", nrow(point_test), "\n")
+cat("Class distribution:\n")
+print(table(point_train$mode))
+```
+
+## Model Selection: Random Forest
+
+A Random Forest is chosen for the per-point model. It works better than a single decision tree on noisy data because it combines many trees and averages their predictions, which reduces the risk of overfitting.
+
+```{r}
+#| message: false
+#| warning: false
+
+library(ranger)
+
+set.seed(42)
+
+point_sample <- point_train |>
+  group_by(mode) |>
+  slice_sample(n = 8000, replace = TRUE) |>
+  ungroup()
+
+rf_model <- ranger(
+  formula        = mode ~ speed + acceleration + sinuosity + turn_angle,
+  data           = point_sample,
+  num.trees      = 300,
+  importance     = "impurity",
+  classification = TRUE,
+  seed           = 42
+)
+
+print(rf_model)
+```
+
+## Evaluation on Testing Data
+
+```{r}
+#| message: false
+#| warning: false
+
+pred_rf <- predict(rf_model, data = point_test)$predictions
+
+pred_rf         <- factor(pred_rf,         levels = sort(levels(point_test$mode)))
+point_test$mode <- factor(point_test$mode, levels = sort(levels(point_test$mode)))
+
+confusionMatrix(pred_rf, reference = point_test$mode)
+```
+
+The per-point Random Forest reaches an overall accuracy of about 50.5%, which is lower than the 69% of the per-segment CART model. This is expected: individual GPS points are much noisier than segment-level summaries, so the task is inherently harder. Walking has the highest sensitivity (0.67), while car and bus are particularly difficult to classify, with sensitivities of only 0.30 and 0.37. Train also performs poorly (0.41), likely because it is very underrepresented in the training data (only 1.4% of all points).
+
+## Feature Importance
+
+```{r}
+#| message: false
+#| warning: false
+#| fig-cap: "Figure 3: Variable importance from the Random Forest model."
+
+importance_df <- data.frame(
+  feature    = names(rf_model$variable.importance),
+  importance = rf_model$variable.importance
+) |>
+  arrange(desc(importance))
+
+ggplot(importance_df, aes(x = reorder(feature, importance), y = importance)) +
+  geom_col(fill = "#377eb8") +
+  coord_flip() +
+  labs(
+    title   = "Random Forest variable importance",
+    x       = NULL,
+    y       = "Mean decrease in node impurity",
+    caption = "Data: GeoLife (Zheng et al. 2011)"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+```
+
+As shown in Figure 3, speed is by far the most important feature. Its importance value is roughly twice as high as sinuosity, which is the second most important. Acceleration and turning angle have similar and lower importance values. This confirms that speed is the main signal for distinguishing transport modes, but sinuosity, acceleration, and turning angle all add something useful on top of that.
+
+## Predicting the Validation Dataset
+
+```{r}
+#| message: false
+#| warning: false
+
+point_val <- full_dataset |>
+  st_drop_geometry() |>
+  filter(data == "validation") |>
+  select(all_of(feat_cols)) |>
+  filter(if_all(all_of(feat_cols), ~ is.finite(.)))
+
+point_val$predicted_mode <- predict(rf_model, data = point_val)$predictions
+
+cat("Predicted class distribution in validation set:\n")
+print(table(point_val$predicted_mode))
+```
+
+## Discussion
+
+The per-point Random Forest model reaches a lower overall accuracy than the per-segment CART baseline (50.5% vs. 69%), which is expected since individual GPS points are much noisier than aggregated segment features. Speed is
+the most important predictor, which matches expectations since different transport modes have very different velocity ranges. Sinuosity helps to further distinguish between modes with similar speeds, for example walking versus cycling. Acceleration and turning angle add additional information, especially for separating bus from car and walking from cycling.
+
+The biggest remaining challenge is the confusion between bus, car, and subway. In dense city traffic, all three can have similar speeds and path shapes, which makes them hard to tell apart from movement features alone. GPS noise also affects the results, particularly for acceleration and turning angle, which are sensitive to measurement errors especially at low speeds.
+
+To improve the model further, one could try using a larger window for sinuosity, adding the time of day as a feature, or including information from the road network, as discussed in the Context-Aware Movement Analysis (CMA2) lecture.
+
+## References
+
+Zheng, Yu, Hao Fu, Xing Xie, Wei-Ying Ma, and Quannan Li. 2011. *Geolife GPS Trajectory
+Dataset - User Guide*. Geolife GPS trajectories 1.1.
+<https://www.microsoft.com/en-us/research/publication/geolife-gps-trajectory-dataset-user-guide/>
+
+---
+
+# Declaration of AI Use
+
+In accordance with the ZHAW Z-RL-Guidelines on AI in assessments (01.04.2023), I declare that I used Claude (Anthropic) as an AI assistant during this assignment.
+
+Claude supported me with debugging errors, correcting text phrasing, and structuring the feature engineering pipeline and classification workflow in this task.
+
+All decisions about structure, approach, and content were made by me. I understood each correction before applying it, and Claude served as a troubleshooting and learning aid rather than a replacement for my own work.
